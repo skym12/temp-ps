@@ -1,65 +1,163 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-$devices = [System.Windows.Forms.VideoCaptureDevice]::GetDevices()
-if ($devices.Count -eq 0) {
-    [System.Windows.Forms.MessageBox]::Show("No webcam found.", "Error", 0, [System.Windows.Forms.MessageBoxIcon]::Error)
-    exit
-}
-$selected = $devices[0]
-if ($devices.Count -gt 1) {
-    $names = $devices | ForEach-Object { $_.Name }
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = "Select Webcam"
-    $form.Size = New-Object System.Drawing.Size(300, 150)
-    $list = New-Object System.Windows.Forms.ListBox
-    $list.Dock = 'Fill'
-    $list.Items.AddRange($names)
-    $list.SelectedIndex = 0
-    $btn = New-Object System.Windows.Forms.Button
-    $btn.Text = "OK"
-    $btn.Dock = 'Bottom'
-    $btn.Add_Click({ $form.Tag = $list.SelectedIndex; $form.Close() })
-    $form.Controls.Add($list)
-    $form.Controls.Add($btn)
-    $form.ShowDialog() | Out-Null
-    $selected = $devices[$form.Tag]
-}
-$videoSource = New-Object System.Windows.Forms.VideoCaptureDevice($selected.MonikerString)
-$videoSource.DesiredFrameSize = New-Object System.Drawing.Size(640, 480)
-$videoSource.DesiredFrameRate = 30
 
-$form = New-Object System.Windows.Forms.Form
-$form.Text = "Live Webcam: $($selected.Name)"
-$form.Size = New-Object System.Drawing.Size(680, 540)
-$form.StartPosition = 'CenterScreen'
-$form.FormBorderStyle = 'Sizable'
-$form.KeyPreview = $true
+$filterGraph = New-Object -ComObject FilterGraph
+$captureGraphBuilder = New-Object -ComObject CaptureGraphBuilder2
+$mediaControl = $filterGraph -as [System.Runtime.InteropServices.ComTypes.IMediaControl]
 
-$pictureBox = New-Object System.Windows.Forms.PictureBox
-$pictureBox.Dock = 'Fill'
-$pictureBox.SizeMode = 'Zoom'
-$form.Controls.Add($pictureBox)
-
-$bitmap = $null
-
-$videoSource.NewFrame.Add({
-    param($sender, $eventArgs)
-    if ($bitmap) { $bitmap.Dispose() }
-    $bitmap = [System.Drawing.Bitmap]$eventArgs.Frame.Clone()
-    if ($pictureBox.Image) { $pictureBox.Image.Dispose() }
-    $pictureBox.Image = $bitmap.Clone()
-})
-
-$form.Add_FormClosing({
-    if ($videoSource.IsRunning) {
-        $videoSource.Stop()
+$systemDeviceEnum = New-Object -ComObject SystemDeviceEnum
+$videoInputCategory = "{860BB310-5D01-11d0-BD3B-00A0C911CE86}"
+$categoryGuid = [Guid]$videoInputCategory
+$enumMoniker = $null
+$null = $systemDeviceEnum.GetType().InvokeMember(
+    "CreateClassEnumerator",
+    [System.Reflection.BindingFlags]::InvokeMethod,
+    $null,
+    $systemDeviceEnum,
+    @($categoryGuid, 0)
+)
+try {
+    $devices = @()
+    $moniker = $null
+    $devEnum = New-Object -ComObject SystemDeviceEnum
+    $classEnum = $null
+    [void]$devEnum.GetType().InvokeMember(
+        "CreateClassEnumerator",
+        [System.Reflection.BindingFlags]::InvokeMethod,
+        $null,
+        $devEnum,
+        @([Guid]"{860BB310-5D01-11d0-BD3B-00A0C911CE86}", 0)
+    )
+    
+    $cameraDevices = Get-WmiObject Win32_PnPEntity | Where-Object {
+        $_.PNPClass -eq 'Camera' -or $_.Name -match 'camera|webcam'
+    } | Where-Object { $_.Status -eq 'OK' }
+    
+    if ($cameraDevices.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "No webcam found or accessible.",
+            "Error",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        )
+        exit
     }
-    if ($bitmap) { $bitmap.Dispose() }
-    if ($pictureBox.Image) { $pictureBox.Image.Dispose() }
-})
+    
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Webcam Viewer - $($cameraDevices[0].Name)"
+    $form.Size = New-Object System.Drawing.Size(680, 540)
+    $form.StartPosition = 'CenterScreen'
+    $form.BackColor = [System.Drawing.Color]::Black
+    
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.Dock = 'Fill'
+    $panel.BackColor = [System.Drawing.Color]::Black
+    $form.Controls.Add($panel)
+    
+    $statusLabel = New-Object System.Windows.Forms.Label
+    $statusLabel.Text = "Initializing webcam..."
+    $statusLabel.ForeColor = [System.Drawing.Color]::White
+    $statusLabel.BackColor = [System.Drawing.Color]::Black
+    $statusLabel.AutoSize = $false
+    $statusLabel.Size = New-Object System.Drawing.Size(660, 30)
+    $statusLabel.Location = New-Object System.Drawing.Point(10, 10)
+    $statusLabel.Font = New-Object System.Drawing.Font("Segoe UI", 12)
+    $panel.Controls.Add($statusLabel)
+    
+    $captureTimer = New-Object System.Windows.Forms.Timer
+    $captureTimer.Interval = 100
+    
+    $captureScript = {
+        try {
+            Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Drawing;
+using System.Drawing.Imaging;
 
-$videoSource.Start()
-Start-Sleep -Milliseconds 500
-
-$form.Add_Shown({ $form.Activate() })
-[System.Windows.Forms.Application]::Run($form)
+public class WebcamCapture {
+    [DllImport("avicap32.dll", EntryPoint="capCreateCaptureWindowA")]
+    public static extern IntPtr capCreateCaptureWindowA(
+        string lpszWindowName, int dwStyle, int x, int y, 
+        int nWidth, int nHeight, IntPtr hwndParent, int nID);
+    
+    [DllImport("user32.dll")]
+    public static extern bool SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    
+    public const int WM_CAP_START = 0x400;
+    public const int WM_CAP_DRIVER_CONNECT = WM_CAP_START + 10;
+    public const int WM_CAP_DRIVER_DISCONNECT = WM_CAP_START + 11;
+    public const int WM_CAP_SET_PREVIEW = WM_CAP_START + 50;
+    public const int WM_CAP_SET_PREVIEWRATE = WM_CAP_START + 52;
+    public const int WM_CAP_SET_SCALE = WM_CAP_START + 53;
+    public const int WS_CHILD = 0x40000000;
+    public const int WS_VISIBLE = 0x10000000;
+}
+"@ -ReferencedAssemblies @("System.Drawing")
+        } catch {
+            # Type already defined
+        }
+        
+        $hWnd = [WebcamCapture]::capCreateCaptureWindowA(
+            "WebcamCapture", 
+            [WebcamCapture]::WS_CHILD -bor [WebcamCapture]::WS_VISIBLE,
+            0, 0, 640, 480, 
+            $panel.Handle, 
+            0
+        )
+        
+        if ($hWnd -ne [IntPtr]::Zero) {
+            $statusLabel.Text = "Connecting to webcam..."
+            
+            # Connect to device 0 (first webcam)
+            $result = [WebcamCapture]::SendMessage($hWnd, [WebcamCapture]::WM_CAP_DRIVER_CONNECT, [IntPtr]0, [IntPtr]0)
+            
+            if ($result) {
+                # Set preview
+                [void][WebcamCapture]::SendMessage($hWnd, [WebcamCapture]::WM_CAP_SET_SCALE, [IntPtr]1, [IntPtr]0)
+                [void][WebcamCapture]::SendMessage($hWnd, [WebcamCapture]::WM_CAP_SET_PREVIEWRATE, [IntPtr]66, [IntPtr]0)
+                [void][WebcamCapture]::SendMessage($hWnd, [WebcamCapture]::WM_CAP_SET_PREVIEW, [IntPtr]1, [IntPtr]0)
+                
+                $statusLabel.Text = "Webcam active - Press ESC or close window to exit"
+                $script:captureHandle = $hWnd
+            } else {
+                $statusLabel.Text = "Failed to connect to webcam"
+            }
+        } else {
+            $statusLabel.Text = "Failed to create capture window"
+        }
+    }
+    
+    # Execute capture initialization
+    & $captureScript
+    
+    # Handle form closing
+    $form.Add_FormClosing({
+        if ($script:captureHandle -and $script:captureHandle -ne [IntPtr]::Zero) {
+            [WebcamCapture]::SendMessage($script:captureHandle, [WebcamCapture]::WM_CAP_DRIVER_DISCONNECT, [IntPtr]0, [IntPtr]0)
+        }
+        if ($captureTimer) {
+            $captureTimer.Stop()
+            $captureTimer.Dispose()
+        }
+    })
+    
+    # ESC key to close
+    $form.Add_KeyDown({
+        if ($_.KeyCode -eq 'Escape') {
+            $form.Close()
+        }
+    })
+    
+    # Show form
+    $form.Add_Shown({ $form.Activate() })
+    [System.Windows.Forms.Application]::Run($form)
+    
+} catch {
+    [System.Windows.Forms.MessageBox]::Show(
+        "Error: $($_.Exception.Message)",
+        "Webcam Error",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    )
+}
