@@ -1,0 +1,65 @@
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$devices = [System.Windows.Forms.VideoCaptureDevice]::GetDevices()
+if ($devices.Count -eq 0) {
+    [System.Windows.Forms.MessageBox]::Show("No webcam found.", "Error", 0, [System.Windows.Forms.MessageBoxIcon]::Error)
+    exit
+}
+$selected = $devices[0]
+if ($devices.Count -gt 1) {
+    $names = $devices | ForEach-Object { $_.Name }
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Select Webcam"
+    $form.Size = New-Object System.Drawing.Size(300, 150)
+    $list = New-Object System.Windows.Forms.ListBox
+    $list.Dock = 'Fill'
+    $list.Items.AddRange($names)
+    $list.SelectedIndex = 0
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Text = "OK"
+    $btn.Dock = 'Bottom'
+    $btn.Add_Click({ $form.Tag = $list.SelectedIndex; $form.Close() })
+    $form.Controls.Add($list)
+    $form.Controls.Add($btn)
+    $form.ShowDialog() | Out-Null
+    $selected = $devices[$form.Tag]
+}
+$videoSource = New-Object System.Windows.Forms.VideoCaptureDevice($selected.MonikerString)
+$videoSource.DesiredFrameSize = New-Object System.Drawing.Size(640, 480)
+$videoSource.DesiredFrameRate = 30
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Live Webcam: $($selected.Name)"
+$form.Size = New-Object System.Drawing.Size(680, 540)
+$form.StartPosition = 'CenterScreen'
+$form.FormBorderStyle = 'Sizable'
+$form.KeyPreview = $true
+
+$pictureBox = New-Object System.Windows.Forms.PictureBox
+$pictureBox.Dock = 'Fill'
+$pictureBox.SizeMode = 'Zoom'
+$form.Controls.Add($pictureBox)
+
+$bitmap = $null
+
+$videoSource.NewFrame.Add({
+    param($sender, $eventArgs)
+    if ($bitmap) { $bitmap.Dispose() }
+    $bitmap = [System.Drawing.Bitmap]$eventArgs.Frame.Clone()
+    if ($pictureBox.Image) { $pictureBox.Image.Dispose() }
+    $pictureBox.Image = $bitmap.Clone()
+})
+
+$form.Add_FormClosing({
+    if ($videoSource.IsRunning) {
+        $videoSource.Stop()
+    }
+    if ($bitmap) { $bitmap.Dispose() }
+    if ($pictureBox.Image) { $pictureBox.Image.Dispose() }
+})
+
+$videoSource.Start()
+Start-Sleep -Milliseconds 500
+
+$form.Add_Shown({ $form.Activate() })
+[System.Windows.Forms.Application]::Run($form)
