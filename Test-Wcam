@@ -1,79 +1,13 @@
+# Working Webcam Viewer for PowerShell
+# Uses AVICAP32.DLL (built into Windows)
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-$filterGraph = New-Object -ComObject FilterGraph
-$captureGraphBuilder = New-Object -ComObject CaptureGraphBuilder2
-$mediaControl = $filterGraph -as [System.Runtime.InteropServices.ComTypes.IMediaControl]
-
-$systemDeviceEnum = New-Object -ComObject SystemDeviceEnum
-$videoInputCategory = "{860BB310-5D01-11d0-BD3B-00A0C911CE86}"
-$categoryGuid = [Guid]$videoInputCategory
-$enumMoniker = $null
-$null = $systemDeviceEnum.GetType().InvokeMember(
-    "CreateClassEnumerator",
-    [System.Reflection.BindingFlags]::InvokeMethod,
-    $null,
-    $systemDeviceEnum,
-    @($categoryGuid, 0)
-)
-try {
-    $devices = @()
-    $moniker = $null
-    $devEnum = New-Object -ComObject SystemDeviceEnum
-    $classEnum = $null
-    [void]$devEnum.GetType().InvokeMember(
-        "CreateClassEnumerator",
-        [System.Reflection.BindingFlags]::InvokeMethod,
-        $null,
-        $devEnum,
-        @([Guid]"{860BB310-5D01-11d0-BD3B-00A0C911CE86}", 0)
-    )
-    
-    $cameraDevices = Get-WmiObject Win32_PnPEntity | Where-Object {
-        $_.PNPClass -eq 'Camera' -or $_.Name -match 'camera|webcam'
-    } | Where-Object { $_.Status -eq 'OK' }
-    
-    if ($cameraDevices.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "No webcam found or accessible.",
-            "Error",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error
-        )
-        exit
-    }
-    
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = "Webcam Viewer - $($cameraDevices[0].Name)"
-    $form.Size = New-Object System.Drawing.Size(680, 540)
-    $form.StartPosition = 'CenterScreen'
-    $form.BackColor = [System.Drawing.Color]::Black
-    
-    $panel = New-Object System.Windows.Forms.Panel
-    $panel.Dock = 'Fill'
-    $panel.BackColor = [System.Drawing.Color]::Black
-    $form.Controls.Add($panel)
-    
-    $statusLabel = New-Object System.Windows.Forms.Label
-    $statusLabel.Text = "Initializing webcam..."
-    $statusLabel.ForeColor = [System.Drawing.Color]::White
-    $statusLabel.BackColor = [System.Drawing.Color]::Black
-    $statusLabel.AutoSize = $false
-    $statusLabel.Size = New-Object System.Drawing.Size(660, 30)
-    $statusLabel.Location = New-Object System.Drawing.Point(10, 10)
-    $statusLabel.Font = New-Object System.Drawing.Font("Segoe UI", 12)
-    $panel.Controls.Add($statusLabel)
-    
-    $captureTimer = New-Object System.Windows.Forms.Timer
-    $captureTimer.Interval = 100
-    
-    $captureScript = {
-        try {
-            Add-Type -TypeDefinition @"
+# Define the webcam capture wrapper
+Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
-using System.Drawing;
-using System.Drawing.Imaging;
 
 public class WebcamCapture {
     [DllImport("avicap32.dll", EntryPoint="capCreateCaptureWindowA")]
@@ -93,71 +27,122 @@ public class WebcamCapture {
     public const int WS_CHILD = 0x40000000;
     public const int WS_VISIBLE = 0x10000000;
 }
-"@ -ReferencedAssemblies @("System.Drawing")
-        } catch {
-            # Type already defined
-        }
-        
+"@ -ReferencedAssemblies @("System.Drawing") -ErrorAction Stop
+
+# Check for webcam using WMI
+$cameraDevices = Get-WmiObject Win32_PnPEntity | Where-Object {
+    ($_.PNPClass -eq 'Camera' -or $_.Name -match 'camera|webcam') -and $_.Status -eq 'OK'
+}
+
+if (-not $cameraDevices -or $cameraDevices.Count -eq 0) {
+    [System.Windows.Forms.MessageBox]::Show(
+        "No webcam found or accessible.",
+        "Error",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    )
+    exit
+}
+
+# Create main form
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Webcam Viewer"
+$form.Size = New-Object System.Drawing.Size(660, 520)
+$form.StartPosition = 'CenterScreen'
+$form.BackColor = [System.Drawing.Color]::Black
+$form.FormBorderStyle = 'FixedSingle'
+$form.MaximizeBox = $false
+
+# Create panel for video preview
+$videoPanel = New-Object System.Windows.Forms.Panel
+$videoPanel.Location = New-Object System.Drawing.Point(10, 50)
+$videoPanel.Size = New-Object System.Drawing.Size(640, 480)
+$videoPanel.BackColor = [System.Drawing.Color]::Black
+$form.Controls.Add($videoPanel)
+
+# Status label
+$statusLabel = New-Object System.Windows.Forms.Label
+$statusLabel.Text = "Initializing webcam..."
+$statusLabel.ForeColor = [System.Drawing.Color]::White
+$statusLabel.BackColor = [System.Drawing.Color]::Black
+$statusLabel.Location = New-Object System.Drawing.Point(10, 10)
+$statusLabel.Size = New-Object System.Drawing.Size(640, 30)
+$statusLabel.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+$statusLabel.TextAlign = 'MiddleCenter'
+$form.Controls.Add($statusLabel)
+
+# Global variable to store capture handle
+$script:captureHandle = [IntPtr]::Zero
+
+# Form shown event - initialize webcam
+$form.Add_Shown({
+    try {
+        # Create capture window
         $hWnd = [WebcamCapture]::capCreateCaptureWindowA(
             "WebcamCapture", 
             [WebcamCapture]::WS_CHILD -bor [WebcamCapture]::WS_VISIBLE,
             0, 0, 640, 480, 
-            $panel.Handle, 
+            $videoPanel.Handle, 
             0
         )
         
-        if ($hWnd -ne [IntPtr]::Zero) {
-            $statusLabel.Text = "Connecting to webcam..."
-            
-            # Connect to device 0 (first webcam)
-            $result = [WebcamCapture]::SendMessage($hWnd, [WebcamCapture]::WM_CAP_DRIVER_CONNECT, [IntPtr]0, [IntPtr]0)
-            
-            if ($result) {
-                # Set preview
-                [void][WebcamCapture]::SendMessage($hWnd, [WebcamCapture]::WM_CAP_SET_SCALE, [IntPtr]1, [IntPtr]0)
-                [void][WebcamCapture]::SendMessage($hWnd, [WebcamCapture]::WM_CAP_SET_PREVIEWRATE, [IntPtr]66, [IntPtr]0)
-                [void][WebcamCapture]::SendMessage($hWnd, [WebcamCapture]::WM_CAP_SET_PREVIEW, [IntPtr]1, [IntPtr]0)
-                
-                $statusLabel.Text = "Webcam active - Press ESC or close window to exit"
-                $script:captureHandle = $hWnd
-            } else {
-                $statusLabel.Text = "Failed to connect to webcam"
-            }
-        } else {
+        if ($hWnd -eq [IntPtr]::Zero) {
             $statusLabel.Text = "Failed to create capture window"
+            $statusLabel.ForeColor = [System.Drawing.Color]::Red
+            return
+        }
+        
+        $script:captureHandle = $hWnd
+        $statusLabel.Text = "Connecting to webcam..."
+        $form.Refresh()
+        
+        Start-Sleep -Milliseconds 100
+        
+        # Connect to first webcam (device index 0)
+        $result = [WebcamCapture]::SendMessage($hWnd, [WebcamCapture]::WM_CAP_DRIVER_CONNECT, [IntPtr]0, [IntPtr]0)
+        
+        if (-not $result) {
+            $statusLabel.Text = "Failed to connect to webcam - Try running as administrator"
+            $statusLabel.ForeColor = [System.Drawing.Color]::Yellow
+            return
+        }
+        
+        # Configure preview
+        [void][WebcamCapture]::SendMessage($hWnd, [WebcamCapture]::WM_CAP_SET_SCALE, [IntPtr]1, [IntPtr]0)
+        [void][WebcamCapture]::SendMessage($hWnd, [WebcamCapture]::WM_CAP_SET_PREVIEWRATE, [IntPtr]66, [IntPtr]0)
+        [void][WebcamCapture]::SendMessage($hWnd, [WebcamCapture]::WM_CAP_SET_PREVIEW, [IntPtr]1, [IntPtr]0)
+        
+        $statusLabel.Text = "Webcam Active - Press ESC or close window to exit"
+        $statusLabel.ForeColor = [System.Drawing.Color]::LimeGreen
+        
+    } catch {
+        $statusLabel.Text = "Error: $($_.Exception.Message)"
+        $statusLabel.ForeColor = [System.Drawing.Color]::Red
+    }
+})
+
+# Form closing event - cleanup
+$form.Add_FormClosing({
+    if ($script:captureHandle -ne [IntPtr]::Zero) {
+        try {
+            [void][WebcamCapture]::SendMessage(
+                $script:captureHandle, 
+                [WebcamCapture]::WM_CAP_DRIVER_DISCONNECT, 
+                [IntPtr]0, 
+                [IntPtr]0
+            )
+        } catch {
+            # Ignore cleanup errors
         }
     }
-    
-    # Execute capture initialization
-    & $captureScript
-    
-    # Handle form closing
-    $form.Add_FormClosing({
-        if ($script:captureHandle -and $script:captureHandle -ne [IntPtr]::Zero) {
-            [WebcamCapture]::SendMessage($script:captureHandle, [WebcamCapture]::WM_CAP_DRIVER_DISCONNECT, [IntPtr]0, [IntPtr]0)
-        }
-        if ($captureTimer) {
-            $captureTimer.Stop()
-            $captureTimer.Dispose()
-        }
-    })
-    
-    # ESC key to close
-    $form.Add_KeyDown({
-        if ($_.KeyCode -eq 'Escape') {
-            $form.Close()
-        }
-    })
-    
-    # Show form
-    $form.Add_Shown({ $form.Activate() })
-    [System.Windows.Forms.Application]::Run($form)
-    
-} catch {
-    [System.Windows.Forms.MessageBox]::Show(
-        "Error: $($_.Exception.Message)",
-        "Webcam Error",
-        [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]::Error
-    )
-}
+})
+
+# ESC key to close
+$form.Add_KeyDown({
+    if ($_.KeyCode -eq 'Escape') {
+        $form.Close()
+    }
+})
+
+# Show form
+[System.Windows.Forms.Application]::Run($form)
